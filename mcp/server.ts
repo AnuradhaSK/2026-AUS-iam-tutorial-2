@@ -23,7 +23,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { createLogger } from "./logger.js";
+import { ansiColor, createLogger } from "./logger.js";
 import {
     getRolesFromPermissions,
     Scope,
@@ -249,20 +249,32 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
         return claimsPromise;
     }
 
+    const subClaim = typeof tokenPayload?.sub === "string" ? tokenPayload.sub : null;
+    const actClaim = tokenPayload?.act ?? null;
+    const actSubClaim = actClaim && typeof actClaim === "object" && typeof (actClaim as { sub?: unknown }).sub === "string"
+        ? (actClaim as { sub: string }).sub
+        : null;
+
     const tokenContext = {
-        sub: typeof tokenPayload?.sub === "string" ? tokenPayload.sub : undefined,
+        sub: subClaim ?? undefined,
+        actSub: actSubClaim ?? undefined,
         org_id: typeof tokenPayload?.org_id === "string" ? tokenPayload.org_id : undefined,
         roles: Array.isArray(tokenPayload?.roles)
             ? tokenPayload.roles.map(String)
             : typeof tokenPayload?.roles === "string"
             ? [tokenPayload.roles]
             : [],
-        hasAct: tokenPayload?.act != null,
+        hasAct: actClaim != null,
     };
 
     const mcpLogger = logger.child({ component: "mcp", reqId });
     const toolLogger = logger.child({ component: "tool", reqId });
 
+    const tokenPayloadFields = tokenPayload
+        ? Object.entries(tokenPayload).map(([key, value]) => `  ${key}: ${JSON.stringify(value)}`).join("\n")
+        : "  none";
+
+    mcpLogger.info(`access token payload:\n${tokenPayloadFields}`);
     mcpLogger.info({ ...tokenContext }, "creating MCP server instance");
 
     const server = new McpServer({
@@ -270,15 +282,36 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
         version: "1.0.0",
     });
 
+    function logToolAuthFailure(name: string, err: unknown, durationMs: number) {
+        if (err instanceof AuthError && err.statusCode === 403) {
+            toolLogger.warn(
+                { tool: name, durationMs, statusCode: err.statusCode, actSub: actSubClaim, sub: subClaim, err: err.message },
+                "denied: insufficient permissions",
+            );
+
+            return true;
+        }
+
+        return false;
+    }
+
     async function runTool<T>(name: string, args: Record<string, unknown>, fn: () => Promise<T>): Promise<T> {
         toolLogger.info({ tool: name, args }, "invoked");
+        toolLogger.info(
+            `calling ${name} by ${ansiColor.green(`{act: ${actSubClaim ? JSON.stringify(actSubClaim) : "null"}, sub: ${subClaim ?? "null"}}`)}`,
+        );
         const t0 = Date.now();
         try {
             const result = await fn();
             toolLogger.info({ tool: name, durationMs: Date.now() - t0 }, "completed");
             return result;
         } catch (err) {
-            toolLogger.error({ tool: name, durationMs: Date.now() - t0, err }, "failed");
+            const durationMs = Date.now() - t0;
+
+            if (!logToolAuthFailure(name, err, durationMs)) {
+                toolLogger.error({ tool: name, durationMs, err }, "failed");
+            }
+
             throw err;
         }
     }
@@ -365,6 +398,8 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
         },
         ({ bookedByName, bookedForName, bookedForUserId, flightId, travelers }) =>
             runTool("create_flight_booking", { bookedForUserId, flightId, travelers }, async () => {
+                const t0 = Date.now();
+
                 try {
                     const claims = await getClaims();
                     requireScope(claims, ["mcp:" + Scope.BOOKING_CREATE]);
@@ -405,6 +440,8 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
                         success: true,
                     });
                 } catch (error) {
+                    logToolAuthFailure("create_flight_booking", error, Date.now() - t0);
+
                     return toBookingFailureToolContent(error);
                 }
             }),
